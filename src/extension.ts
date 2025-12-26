@@ -1,139 +1,125 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
-// moved heavy helpers to `src/helpers.ts` and import them there
 import * as fs from 'fs';
 import * as puppeteer from 'puppeteer';
-// marked-katex and twemoji are used in helpers
-import { getChromeExecutableCandidates, getHtmlForWebview } from './helpers';
+import { getHtmlForWebview, getChromeExecutableCandidates } from './helpers';
 
-// Fix for missing types for marked-katex-extension
-// eslint-disable-next-line @typescript-eslint/triple-slash-reference
-/// <reference types="node" />
-
-declare const global: { browserInstance?: puppeteer.Browser };
-
-// Reusable browser instance for PDF exports
 let browserInstance: puppeteer.Browser | null = null;
+let browserInitPromise: Promise<puppeteer. Browser> | null = null;
 
-// Function to get or create browser instance
-async function getBrowserInstance(): Promise<puppeteer.Browser> {
-    if (!browserInstance || !await isBrowserAvailable(browserInstance)) {
-        if (browserInstance) {
-            try {
-                await browserInstance.close();
-            } catch (error) {
-                console.error('Error closing browser instance:', error);
-            }
-        }
-        browserInstance = await launchPuppeteerWithFallbacks();
-    }
-    return browserInstance;
-}
-
-// Try launching Puppeteer with multiple strategies to avoid version pinning issues
-async function launchPuppeteerWithFallbacks(): Promise<puppeteer.Browser> {
-    const commonArgs = [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu',
-        '--no-zygote',
-        '--no-first-run'
-    ];
-
-    const errors: Array<string> = [];
-
-    // 1) Default bundled Chromium (if available)
-    try {
-        return await puppeteer.launch({ headless: true, args: commonArgs });
-    } catch (error) {
-        errors.push(`Default launch failed: ${error instanceof Error ? error.message : String(error)}`);
+async function initBrowser(): Promise<puppeteer.Browser> {
+    if (browserInstance && browserInstance.connected) {
+        return browserInstance;
     }
 
-    // 2) Try system Chrome via channel (stable)
-    try {
-        return await puppeteer.launch({ channel: 'chrome', headless: true, args: commonArgs } as any);
-    } catch (error) {
-        errors.push(`Channel chrome launch failed: ${error instanceof Error ? error.message : String(error)}`);
+    if (browserInitPromise) {
+        return browserInitPromise;
     }
 
-    // 3) Try system Chromium via channel
-    try {
-        return await puppeteer.launch({ channel: 'chromium', headless: true, args: commonArgs } as any);
-    } catch (error) {
-        errors.push(`Channel chromium launch failed: ${error instanceof Error ? error.message : String(error)}`);
-    }
+    browserInitPromise = (async () => {
+        const candidates = getChromeExecutableCandidates();
+        let lastError: Error | null = null;
 
-    // 4) Try known executable paths
-    const candidates = getChromeExecutableCandidates();
-    for (const executablePath of candidates) {
+        // Strategy 1: Try puppeteer's bundled Chromium
         try {
-            // eslint-disable-next-line no-await-in-loop
-            const browser = await puppeteer.launch({ executablePath, headless: true, args: commonArgs });
+            console.log('Attempting to launch bundled Chromium...');
+            const browser = await puppeteer.launch({
+                headless: true,
+                args: [
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-gpu'
+                ]
+            });
+            browserInstance = browser;
+            console.log('Successfully launched bundled Chromium');
             return browser;
         } catch (error) {
-            errors.push(`Executable ${executablePath} failed: ${error instanceof Error ? error.message : String(error)}`);
+            lastError = error instanceof Error ? error : new Error(String(error));
+            console. error('Failed to launch bundled Chromium:', lastError. message);
         }
-    }
 
-    // 5) Last resort: try puppeteer.executablePath() if available
+        // Strategy 2: Try system Chrome/Chromium installations
+        for (const executablePath of candidates) {
+            try {
+                if (! fs.existsSync(executablePath)) {
+                    console. log(`Skipping non-existent path: ${executablePath}`);
+                    continue;
+                }
+
+                console.log(`Attempting to launch browser at: ${executablePath}`);
+                const browser = await puppeteer.launch({
+                    executablePath,
+                    headless: true,
+                    args:  [
+                        '--no-sandbox',
+                        '--disable-setuid-sandbox',
+                        '--disable-dev-shm-usage',
+                        '--disable-gpu'
+                    ]
+                });
+                browserInstance = browser;
+                console.log(`Successfully launched browser at: ${executablePath}`);
+                return browser;
+            } catch (error) {
+                lastError = error instanceof Error ? error : new Error(String(error));
+                console.error(`Failed to launch browser at ${executablePath}:`, lastError.message);
+            }
+        }
+
+        // If all strategies failed, throw the last error
+        const errorMessage = lastError
+            ? `Failed to launch browser.  Last error: ${lastError.message}. Please ensure Chrome or Chromium is installed. `
+            : 'Failed to launch browser. No executable paths were tried.';
+
+        throw new Error(errorMessage);
+    })();
+
     try {
-        const p = (puppeteer as any).executablePath ? (puppeteer as any).executablePath() : undefined;
-        if (p) {
-            return await puppeteer.launch({ executablePath: p, headless: true, args: commonArgs });
-        }
-    } catch (error) {
-        errors.push(`executablePath() launch failed: ${error instanceof Error ? error.message : String(error)}`);
+        const browser = await browserInitPromise;
+        return browser;
+    } finally {
+        browserInitPromise = null;
     }
-
-    throw new Error(
-        'Failed to launch Chrome/Chromium for PDF export. Attempts: \n' + errors.join('\n') +
-        '\nPlease ensure Google Chrome or Chromium is installed and accessible.'
-    );
 }
 
-
-// Check if browser instance is still available
-async function isBrowserAvailable(browser: puppeteer.Browser): Promise<boolean> {
-    try {
-        // Try to get the browser process ID to check if it's still running
-        const process = browser.process();
-        return !!process && !process.killed;
-    } catch (error) {
-        return false;
+async function getBrowserInstance(): Promise<puppeteer.Browser> {
+    if (browserInstance && browserInstance.connected) {
+        return browserInstance;
     }
+    return await initBrowser();
 }
 
-// Function to clean up browser instance
-async function cleanupBrowser(): Promise<void> {
+async function cleanupBrowser() {
     if (browserInstance) {
         try {
             await browserInstance.close();
-            browserInstance = null;
+            console.log('Browser instance closed successfully');
         } catch (error) {
-            console.error('Error cleaning up browser instance:', error);
+            console.error('Error closing browser:', error);
+        } finally {
+            browserInstance = null;
         }
     }
 }
 
-// Helpers moved to `src/helpers.ts` to allow unit tests without `vscode` runtime
-
-export function activate(context: vscode.ExtensionContext) {
+export function activate(context: vscode. ExtensionContext) {
     console.log('Markdown Rich Preview & Export is now active!');
 
     // Register the command
     const disposable = vscode.commands.registerCommand('markdown-rich-preview.showPreview', () => {
         const editor = vscode.window.activeTextEditor;
-        
+
         if (!editor || editor.document.languageId !== 'markdown') {
             vscode.window.showErrorMessage('Please open a markdown file first');
             return;
         }
-        
+
         // Create and show webview panel
-        const panel = vscode.window.createWebviewPanel(
+        const panel = vscode. window.createWebviewPanel(
             'markdown-rich-preview',
-            `Preview: ${path.basename(editor.document.fileName)}`,
+            `Preview:  ${path.basename(editor.document.fileName)}`,
             vscode.ViewColumn.Active,
             {
                 enableScripts: true,
@@ -142,30 +128,30 @@ export function activate(context: vscode.ExtensionContext) {
                 ]
             }
         );
-        
-    // Initial update
-    updateContent(panel, editor.document, context);
-        
+
+        // Initial update
+        updateContent(panel, editor.document, context);
+
         // Update content when the document changes
         const changeDocumentSubscription = vscode.workspace.onDidChangeTextDocument(e => {
-        if (e.document.uri.toString() === editor.document.uri.toString()) {
+            if (e. document.uri.toString() === editor.document.uri. toString()) {
                 updateContent(panel, e.document, context);
             }
         });
-        
+
         // Clean up resources when panel is closed
         panel.onDidDispose(() => {
-            changeDocumentSubscription.dispose();
+            changeDocumentSubscription. dispose();
         });
     });
-    
+
     context.subscriptions.push(disposable);
 
     // Register the export to HTML command
     const exportToHtmlCommand = vscode.commands.registerCommand('markdown-rich-preview.exportToHtml', async () => {
-        const editor = vscode.window.activeTextEditor;
+        const editor = vscode. window.activeTextEditor;
 
-        if (!editor || editor.document.languageId !== 'markdown') {
+        if (!editor || editor. document.languageId !== 'markdown') {
             vscode.window.showErrorMessage('Please open a Markdown file first to export.');
             return;
         }
@@ -175,7 +161,7 @@ export function activate(context: vscode.ExtensionContext) {
         const assetBaseForExport = `file://${path.join(context.extensionPath, 'assets', 'vendor')}`;
         const htmlContent = getHtmlForWebview(markdownContent, false, assetBaseForExport);
 
-        const defaultFileName = path.basename(editor.document.fileName, path.extname(editor.document.fileName)) + '.html';
+        const defaultFileName = path.basename(editor.document.fileName, path.extname(editor.document. fileName)) + '.html';
         const uri = await vscode.window.showSaveDialog({
             defaultUri: vscode.Uri.file(path.join(editor.document.uri.fsPath, '..', defaultFileName)),
             filters: {
@@ -206,14 +192,14 @@ export function activate(context: vscode.ExtensionContext) {
         }
 
         const markdownContent = editor.document.getText();
-    // Pass true for isForPdf to include PDF-specific styles
-    // For PDF export we prefer absolute file URIs so Puppeteer can load local assets
-    const assetBaseForExport = `file://${path.join(context.extensionPath, 'assets', 'vendor')}`;
-    const htmlContent = getHtmlForWebview(markdownContent, true, assetBaseForExport);
+        // Pass true for isForPdf to include PDF-specific styles
+        // For PDF export we prefer absolute file URIs so Puppeteer can load local assets
+        const assetBaseForExport = `file://${path.join(context.extensionPath, 'assets', 'vendor')}`;
+        const htmlContent = getHtmlForWebview(markdownContent, true, assetBaseForExport);
 
-        const defaultFileName = path.basename(editor.document.fileName, path.extname(editor.document.fileName)) + '.pdf';
+        const defaultFileName = path.basename(editor. document.fileName, path.extname(editor.document.fileName)) + '.pdf';
         const uri = await vscode.window.showSaveDialog({
-            defaultUri: vscode.Uri.file(path.join(editor.document.uri.fsPath, '..', defaultFileName)),
+            defaultUri:  vscode.Uri.file(path.join(editor.document.uri.fsPath, '..', defaultFileName)),
             filters: {
                 // eslint-disable-next-line @typescript-eslint/naming-convention
                 'PDF Files': ['pdf']
@@ -223,48 +209,58 @@ export function activate(context: vscode.ExtensionContext) {
         if (uri) {
             let page: puppeteer.Page | null = null;
             try {
-                vscode.window.withProgress({
-                    location: vscode.ProgressLocation.Notification,
+                await vscode.window.withProgress({
+                    location: vscode.ProgressLocation. Notification,
                     title: 'Generating PDF...',
                     cancellable: false
                 }, async () => {
                     try {
                         const browser = await getBrowserInstance();
                         page = await browser.newPage();
-                        
+
                         // Set a timeout for page operations
                         page.setDefaultNavigationTimeout(30000);
-                        
+
                         // Use domcontentloaded for faster rendering since we're not waiting for network resources
                         await page.setContent(htmlContent, { waitUntil: 'domcontentloaded' });
-                        
+
+                        // صبر برای رندر شدن نمودارهای Mermaid
+                        try {
+                            await page. waitForFunction(() => (window as any).mermaidReady === true, {
+                                timeout: 10000
+                            });
+                            console.log('Mermaid diagrams rendered successfully');
+                        } catch (e) {
+                            console. log('Mermaid rendering timeout or no mermaid diagrams present');
+                        }
+
                         // Wait for any remaining resources to load (with a timeout)
                         try {
-                            await page.waitForNetworkIdle({ timeout: 2000 });
+                            await page.waitForNetworkIdle({ timeout:  2000 });
                         } catch (e) {
                             // Ignore timeout errors, proceed with what we have
                         }
-                        
+
                         const pdfBuffer = await page.pdf({
                             format: 'A4',
-                            printBackground: true,
+                            printBackground:  true,
                             margin: {
-                                top: '20mm',
-                                right: '20mm',
-                                bottom: '20mm',
-                                left: '20mm'
+                                top: '2mm',
+                                right: '2mm',
+                                bottom: '2mm',
+                                left:  '2mm'
                             },
                             preferCSSPageSize: true
                         });
 
                         fs.writeFileSync(uri.fsPath, pdfBuffer);
-                        vscode.window.showInformationMessage(`Successfully exported PDF to ${path.basename(uri.fsPath)}`);
+                        vscode.window. showInformationMessage(`Successfully exported PDF to ${path.basename(uri.fsPath)}`);
                     } catch (error) {
                         vscode.window.showErrorMessage(`Failed to export PDF: ${error instanceof Error ? error.message : String(error)}`);
                         console.error('PDF Export Error:', error);
                         throw error; // Re-throw to ensure the progress indicator shows the error
                     } finally {
-                        if (page && !page.isClosed()) {
+                        if (page && ! page.isClosed()) {
                             await page.close().catch(console.error);
                         }
                     }
@@ -279,14 +275,14 @@ export function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(exportToPdfCommand);
 }
 
-function updateContent(panel: vscode.WebviewPanel, document: vscode.TextDocument, context: vscode.ExtensionContext) {
+function updateContent(panel: vscode. WebviewPanel, document: vscode.TextDocument, context: vscode.ExtensionContext) {
     // Get the markdown content
     const markdownContent = document.getText();
 
     // Compute asset base for webview resources using asWebviewUri
     let assetBase;
     try {
-        const vendorFolder = vscode.Uri.file(path.join(context.extensionPath, 'assets', 'vendor'));
+        const vendorFolder = vscode.Uri.file(path. join(context.extensionPath, 'assets', 'vendor'));
         assetBase = panel.webview.asWebviewUri(vendorFolder).toString();
     } catch (e) {
         // fallback to undefined (CDN)
@@ -299,8 +295,6 @@ function updateContent(panel: vscode.WebviewPanel, document: vscode.TextDocument
     // Update webview content
     panel.webview.html = html;
 }
-
-    
 
 export function deactivate() {
     void cleanupBrowser();
